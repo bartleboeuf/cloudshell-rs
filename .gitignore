@@ -1,0 +1,11 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.claude
+CLAUDE.md
+old_src/
+
+# Added by cargo
+
+/target
