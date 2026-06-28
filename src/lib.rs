@@ -58,12 +58,12 @@ impl CloudShellClient {
     /// * `vpc_config` - Optional VPC configuration (None = public environment)
     ///
     /// # Example: Public environment
-    /// ```
+    /// ```ignore
     /// let response = client.create_environment(None, None).await?;
     /// ```
     ///
     /// # Example: VPC environment
-    /// ```
+    /// ```ignore
     /// let vpc = VpcConfig::new(
     ///     "vpc-123".to_string(),
     ///     vec!["subnet-1".to_string()],
@@ -147,7 +147,7 @@ impl CloudShellClient {
     /// Returns an error if `tab_id` is not a valid UUID v4
     ///
     /// # Example
-    /// ```
+    /// ```ignore
     /// use uuid::Uuid;
     /// let tab_id = Uuid::new_v4().to_string();
     /// let session = client.create_session(&env_id, "TMUX", &tab_id, Some(true)).await?;
@@ -359,17 +359,14 @@ impl VpcConfig {
     ///
     /// # Example
     /// ```
+    /// use cloudshell_rs::VpcConfig;
     /// let vpc = VpcConfig::new(
     ///     "vpc-123".to_string(),
     ///     vec!["subnet-1".to_string()],
     ///     vec!["sg-1".to_string()],
     /// );
     /// ```
-    pub fn new(
-        vpc_id: String,
-        subnet_ids: Vec<String>,
-        security_group_ids: Vec<String>,
-    ) -> Self {
+    pub fn new(vpc_id: String, subnet_ids: Vec<String>, security_group_ids: Vec<String>) -> Self {
         if security_group_ids.len() > 5 {
             panic!(
                 "Max 5 security groups allowed, got {}",
@@ -389,6 +386,7 @@ impl VpcConfig {
     ///
     /// # Example
     /// ```
+    /// use cloudshell_rs::VpcConfig;
     /// let vpc = VpcConfig {
     ///     vpc_id: "vpc-123".to_string(),
     ///     subnet_ids: vec!["subnet-1".to_string()],

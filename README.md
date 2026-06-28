@@ -51,7 +51,7 @@ AWS CloudShell has no public SDK. This project provides a **type-safe, high-perf
 
 ## Prerequisites
 
-- **Rust 1.93.0+** ([install](https://rustup.rs/))
+- **Rust 1.96.0+** ([install](https://rustup.rs/))
 - **AWS credentials** configured (profile, env vars, or IAM role)
 - **For SSM integration**: [`session-manager-plugin`](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (optional)
 

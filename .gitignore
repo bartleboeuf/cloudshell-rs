@@ -7,5 +7,5 @@ CLAUDE.md
 old_src/
 
 # Added by cargo
-
+Cargo.lock
 /target

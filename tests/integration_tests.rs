@@ -1094,8 +1094,8 @@ fn test_invalid_uuid_formats() {
     // These are invalid UUID formats
     let invalid_uuids = vec![
         "not-a-uuid",
-        "550e8400-e29b-41d4-a716",  // Too short
-        "550e8400-e29b-41d4-a716-446655440000-extra",  // Too long
+        "550e8400-e29b-41d4-a716",                    // Too short
+        "550e8400-e29b-41d4-a716-446655440000-extra", // Too long
         "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
         "",
         "not-really-a-uuid-at-all",

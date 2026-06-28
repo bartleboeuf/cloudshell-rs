@@ -10,7 +10,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "ssm-cloudshell")]
+#[command(name = "cloudshell-rs")]
 #[command(about = "AWS CloudShell API client")]
 struct Args {
     /// AWS profile to use
@@ -49,11 +49,11 @@ enum Command {
     /// **Example:**
     /// ```
     /// # Public
-    /// ssm-cloudshell create
-    /// ssm-cloudshell create --name my-env
+    /// cloudshell-rs create
+    /// cloudshell-rs create --name my-env
     ///
     /// # VPC
-    /// ssm-cloudshell create --name my-vpc-env \
+    /// cloudshell-rs create --name my-vpc-env \
     ///   --vpc-id vpc-123 \
     ///   --subnet-ids subnet-1,subnet-2 \
     ///   --security-group-ids sg-1,sg-2
@@ -84,7 +84,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell status abc123-def4-5678-ghij
+    /// cloudshell-rs status abc123-def4-5678-ghij
     /// ```
     #[command(about = "Get environment status (CREATING, RUNNING, SUSPENDED, etc)")]
     Status {
@@ -100,7 +100,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell start abc123-def4-5678-ghij
+    /// cloudshell-rs start abc123-def4-5678-ghij
     /// ```
     #[command(about = "Start a suspended environment")]
     Start {
@@ -117,7 +117,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell stop abc123-def4-5678-ghij
+    /// cloudshell-rs stop abc123-def4-5678-ghij
     /// ```
     #[command(about = "Stop a running environment (transitions to SUSPENDED)")]
     Stop {
@@ -135,7 +135,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell delete abc123-def4-5678-ghij
+    /// cloudshell-rs delete abc123-def4-5678-ghij
     /// ```
     #[command(about = "Delete an environment (⚠️  irreversible)")]
     Delete {
@@ -155,7 +155,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell session abc123-def4-5678-ghij --tab-id $(uuidgen)
+    /// cloudshell-rs session abc123-def4-5678-ghij --tab-id $(uuidgen)
     /// ```
     #[command(about = "Create a session (returns SessionId, TokenValue, StreamUrl)")]
     Session {
@@ -182,11 +182,11 @@ enum Command {
     /// **Example:**
     /// ```
     /// # Send heartbeat once
-    /// ssm-cloudshell heartbeat abc123-def4-5678-ghij
+    /// cloudshell-rs heartbeat abc123-def4-5678-ghij
     ///
     /// # Keep alive every 5 minutes
     /// while true; do
-    ///   ssm-cloudshell heartbeat abc123-def4-5678-ghij
+    ///   cloudshell-rs heartbeat abc123-def4-5678-ghij
     ///   sleep 300
     /// done
     /// ```
@@ -207,7 +207,7 @@ enum Command {
     /// **Example:**
     /// ```
     /// # Get upload URL
-    /// ssm-cloudshell upload abc123-def4-5678-ghij
+    /// cloudshell-rs upload abc123-def4-5678-ghij
     ///
     /// # Upload a file (extract URL and fields from response)
     /// curl -F file=@script.sh \
@@ -231,7 +231,7 @@ enum Command {
     ///
     /// **Example:**
     /// ```
-    /// ssm-cloudshell download abc123-def4-5678-ghij
+    /// cloudshell-rs download abc123-def4-5678-ghij
     /// curl <presigned_url> -o myfile.txt
     /// ```
     #[command(about = "Get presigned S3 URLs for file download")]
@@ -263,17 +263,15 @@ enum Command {
     /// **Example:**
     /// ```
     /// # Interactive shell (default)
-    /// ssm-cloudshell connect
-    /// ssm-cloudshell connect abc123-def4-5678-ghij
-    /// ssm-cloudshell connect --timeout-secs 300
+    /// cloudshell-rs connect
+    /// cloudshell-rs connect abc123-def4-5678-ghij
+    /// cloudshell-rs connect --timeout-secs 300
     ///
     /// # Auto-inject credentials (silent, secure)
-    /// ssm-cloudshell connect --inject-credentials
-    /// ssm-cloudshell connect --profile myprofile --inject-credentials
+    /// cloudshell-rs connect --inject-credentials
+    /// cloudshell-rs connect --profile myprofile --inject-credentials
     /// ```
-    #[command(
-        about = "Connect to CloudShell via SSM Session Manager (interactive shell)"
-    )]
+    #[command(about = "Connect to CloudShell via SSM Session Manager (interactive shell)")]
     Connect {
         /// Environment ID (optional - uses existing or creates new)
         #[arg(value_name = "ENV_ID")]
@@ -556,7 +554,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let response = client.create_environment(name.as_deref(), vpc_config).await?;
+            let response = client
+                .create_environment(name.as_deref(), vpc_config)
+                .await?;
             println!("{}", response.pretty_print()?);
         }
 
