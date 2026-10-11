@@ -5,6 +5,7 @@ use aws_sigv4::http_request::{
 };
 use std::time::{Duration, SystemTime};
 
+pub mod heartbeat;
 pub mod progress;
 pub mod ssm;
 pub mod workflow;
@@ -17,12 +18,23 @@ pub enum CloudShellError {
     Json(String),
     Request(String),
     Network(String),
-    Aws { status: String, message: String },
+    Aws {
+        status: String,
+        message: String,
+    },
     InvalidUuid(String),
     Io(String),
     Process(String),
     Response(String),
     Timeout(String),
+    /// A service quota or account limit was exceeded (e.g. 200 h/month usage quota)
+    Quota(String),
+    /// The API throttled the request (retried automatically; surfaced if retries are exhausted)
+    Throttled(String),
+    /// Transient server-side failure (HTTP 5xx)
+    Transient(String),
+    /// Credentials could not be decrypted (e.g. `put_credentials` without a console token)
+    TokenDecryption(String),
 }
 
 impl std::fmt::Display for CloudShellError {
@@ -38,7 +50,11 @@ impl std::fmt::Display for CloudShellError {
             | Self::Io(message)
             | Self::Process(message)
             | Self::Response(message)
-            | Self::Timeout(message) => write!(f, "{message}"),
+            | Self::Timeout(message)
+            | Self::Quota(message)
+            | Self::Throttled(message)
+            | Self::Transient(message)
+            | Self::TokenDecryption(message) => write!(f, "{message}"),
             Self::Aws { status, message } => write!(f, "AWS request failed ({status}): {message}"),
         }
     }
@@ -158,6 +174,10 @@ impl CloudShellClient {
             });
         }
 
+        if vpc_config.is_some() {
+            self.ensure_vpc_quota_available().await?;
+        }
+
         let json = self.call_api_json("createEnvironment", &body).await?;
 
         Ok(CreateEnvironmentResponse { raw_response: json })
@@ -239,7 +259,10 @@ impl CloudShellClient {
     }
 
     /// Send a heartbeat to keep a CloudShell environment alive
+    ///
+    /// For a periodic heartbeat, see [`crate::heartbeat::spawn_heartbeat`].
     pub async fn send_heart_beat(&self, environment_id: &str) -> CloudResult<()> {
+        require_non_empty("EnvironmentId", environment_id)?;
         let body = serde_json::json!({ "EnvironmentId": environment_id });
         self.call_api("sendHeartBeat", &body).await?;
         Ok(())
@@ -247,6 +270,8 @@ impl CloudShellClient {
 
     /// Delete a CloudShell session
     pub async fn delete_session(&self, environment_id: &str, session_id: &str) -> CloudResult<()> {
+        require_non_empty("EnvironmentId", environment_id)?;
+        require_non_empty("SessionId", session_id)?;
         let body = serde_json::json!({
             "EnvironmentId": environment_id,
             "SessionId": session_id,
@@ -256,7 +281,24 @@ impl CloudShellClient {
     }
 
     /// Delete a CloudShell environment
+    ///
+    /// Pre-validates the environment state: the API only accepts deletes for
+    /// environments in `RUNNING` or `SUSPENDED` state. This costs one extra
+    /// `GetEnvironmentStatus` call.
     pub async fn delete_environment(&self, environment_id: &str) -> CloudResult<()> {
+        require_non_empty("EnvironmentId", environment_id)?;
+
+        let status = self.get_environment_status(environment_id).await?.status();
+        match status.as_deref() {
+            Some("RUNNING") | Some("SUSPENDED") => {}
+            other => {
+                return Err(CloudShellError::Validation(format!(
+                    "Cannot delete environment {environment_id} in state {}: it must be RUNNING or SUSPENDED",
+                    other.unwrap_or("UNKNOWN")
+                )));
+            }
+        }
+
         let body = serde_json::json!({ "EnvironmentId": environment_id });
         self.call_api("deleteEnvironment", &body).await?;
         Ok(())
@@ -284,8 +326,13 @@ impl CloudShellClient {
         Ok(FileTransferResponse { raw_response: json })
     }
 
-    /// Put credentials into a CloudShell environment (console session tokens only)
+    /// Put credentials into a CloudShell environment
+    ///
+    /// **Console-only:** the API requires a console session token. Programmatic callers
+    /// get [`CloudShellError::TokenDecryption`]. To inject credentials, export the `AWS_*`
+    /// variables over an SSM session instead (see `connect --inject-credentials`).
     pub async fn put_credentials(&self, environment_id: &str) -> CloudResult<()> {
+        require_non_empty("EnvironmentId", environment_id)?;
         let body = serde_json::json!({ "EnvironmentId": environment_id });
         self.call_api("putCredentials", &body).await?;
         Ok(())
@@ -300,8 +347,51 @@ impl CloudShellClient {
         Ok(serde_json::from_str(&response)?)
     }
 
-    /// Call a CloudShell API operation
+    /// Pre-validate the VPC environment quota (max [`MAX_VPC_ENVIRONMENTS`] per principal).
+    ///
+    /// Best-effort: counts environments whose describe output includes a `VpcConfig` key.
+    async fn ensure_vpc_quota_available(&self) -> CloudResult<()> {
+        let existing = self
+            .describe_environments()
+            .await?
+            .environments()
+            .iter()
+            .filter(|env| env.get("VpcConfig").is_some())
+            .count();
+
+        if existing >= MAX_VPC_ENVIRONMENTS {
+            return Err(CloudShellError::Quota(format!(
+                "VPC environment limit reached: {existing}/{MAX_VPC_ENVIRONMENTS} already exist for this principal"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Call a CloudShell API operation, retrying transient failures with exponential backoff.
+    ///
+    /// Retry policy (see [`should_retry`]):
+    /// - Throttling is retried for every operation (the request was rejected, nothing ran).
+    /// - 5xx and network errors are retried only for operations in [`is_retry_safe_operation`].
+    /// - Quota errors are never retried.
     async fn call_api(&self, operation: &str, body: &serde_json::Value) -> CloudResult<String> {
+        let body_bytes = serde_json::to_vec(body)?;
+        let retry_safe = is_retry_safe_operation(operation);
+        let mut attempt: u32 = 1;
+
+        loop {
+            match self.send_signed(operation, &body_bytes).await {
+                Ok(response_body) => return Ok(response_body),
+                Err(err) if attempt < RETRY_MAX_ATTEMPTS && should_retry(&err, retry_safe) => {
+                    tokio::time::sleep(backoff_delay(attempt)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Sign (with a fresh timestamp) and send a single HTTP request.
+    async fn send_signed(&self, operation: &str, body_bytes: &[u8]) -> CloudResult<String> {
         let service = "cloudshell";
         let host = format!("{}.{}.amazonaws.com", service, self.region);
         let url = format!("https://{}/{}", host, operation);
@@ -312,13 +402,11 @@ impl CloudShellClient {
             ("host", host.as_str()),
         ];
 
-        let body_bytes = serde_json::to_vec(body)?;
-
         let signable_request = SignableRequest::new(
             "POST",
             &url,
             headers_for_signing.iter().copied(),
-            SignableBody::Bytes(&body_bytes),
+            SignableBody::Bytes(body_bytes),
         )
         .map_err(|err| CloudShellError::Request(err.to_string()))?;
 
@@ -342,8 +430,6 @@ impl CloudShellClient {
 
         // Build final request with all headers
         let mut final_headers = reqwest::header::HeaderMap::new();
-
-        // Add Content-Type header
         final_headers.insert(
             "Content-Type"
                 .parse::<reqwest::header::HeaderName>()
@@ -364,76 +450,114 @@ impl CloudShellClient {
             );
         }
 
-        // Make HTTP POST request
-        let retryable_operation = is_retryable_operation(operation);
-        let mut attempt = 0;
+        let response = self
+            .http_client
+            .post(&url)
+            .headers(final_headers)
+            .body(body_bytes.to_vec())
+            .send()
+            .await?;
+        let status = response.status();
+        let response_body = response.text().await?;
 
-        loop {
-            attempt += 1;
-            let response = match self
-                .http_client
-                .post(&url)
-                .headers(final_headers.clone())
-                .body(body_bytes.clone())
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(err)
-                    if retryable_operation
-                        && attempt < 3
-                        && (err.is_timeout() || err.is_connect()) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                    continue;
-                }
-                Err(err) => return Err(CloudShellError::Network(err.to_string())),
-            };
-
-            let status = response.status();
-            if retryable_operation && is_retryable_status(status) && attempt < 3 {
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                continue;
-            }
-
-            let response_body = match response.text().await {
-                Ok(body) => body,
-                Err(err)
-                    if retryable_operation
-                        && attempt < 3
-                        && (err.is_timeout() || err.is_connect()) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                    continue;
-                }
-                Err(err) => return Err(CloudShellError::Network(err.to_string())),
-            };
-
-            return if status.is_success() {
-                Ok(response_body)
-            } else {
-                Err(CloudShellError::Aws {
-                    status: status.to_string(),
-                    message: response_body,
-                })
-            };
+        if status.is_success() {
+            Ok(response_body)
+        } else {
+            Err(parse_api_error(status, &response_body))
         }
     }
 }
 
-fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+/// Maximum number of VPC environments per IAM principal.
+pub const MAX_VPC_ENVIRONMENTS: usize = 2;
+
+/// Maximum number of security groups per VPC environment.
+pub const MAX_SECURITY_GROUPS: usize = 5;
+
+/// Total attempts (initial + retries) for a retryable API call.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+const RETRY_BASE_DELAY_MS: u64 = 250;
+const RETRY_MAX_DELAY_MS: u64 = 8_000;
+
+fn require_non_empty(name: &str, value: &str) -> CloudResult<()> {
+    if value.trim().is_empty() {
+        Err(CloudShellError::Validation(format!(
+            "{name} cannot be empty"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Operations with no side effects or where repeating them is harmless.
+/// Creates and deletes are excluded: a retry after a server-side success would
+/// duplicate the resource or report a confusing not-found error.
+fn is_retry_safe_operation(operation: &str) -> bool {
     matches!(
-        status,
-        reqwest::StatusCode::TOO_MANY_REQUESTS
-            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
+        operation,
+        "describeEnvironments"
+            | "getEnvironmentStatus"
+            | "sendHeartBeat"
+            | "startEnvironment"
+            | "stopEnvironment"
+            | "getFileUploadUrls"
+            | "getFileDownloadUrls"
     )
 }
 
-fn is_retryable_operation(operation: &str) -> bool {
-    matches!(operation, "describeEnvironments" | "getEnvironmentStatus")
+fn should_retry(err: &CloudShellError, retry_safe: bool) -> bool {
+    match err {
+        CloudShellError::Throttled(_) => true,
+        CloudShellError::Transient(_) | CloudShellError::Network(_) => retry_safe,
+        _ => false,
+    }
+}
+
+/// Exponential backoff with jitter: the delay for `attempt` (1-based) is in
+/// `[cap/2, cap]` where `cap = min(base * 2^(attempt-1), max)`.
+fn backoff_delay(attempt: u32) -> Duration {
+    let exp = RETRY_BASE_DELAY_MS.saturating_mul(1u64 << attempt.saturating_sub(1).min(10));
+    let cap = exp.min(RETRY_MAX_DELAY_MS);
+    let jitter = uuid::Uuid::new_v4().as_u128() as u64 % (cap / 2 + 1);
+    Duration::from_millis(cap / 2 + jitter)
+}
+
+/// Map an HTTP error response to a typed error using the AWS JSON error `__type` code.
+fn parse_api_error(status: reqwest::StatusCode, body: &str) -> CloudShellError {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let code = json
+        .as_ref()
+        .and_then(|j| j.get("__type").or_else(|| j.get("code")))
+        .and_then(|v| v.as_str())
+        .map(|t| t.rsplit(['#', ':']).next().unwrap_or(t).to_string())
+        .unwrap_or_default();
+    let message = json
+        .as_ref()
+        .and_then(|j| j.get("message").or_else(|| j.get("Message")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| body.trim().to_string());
+    let detail = if code.is_empty() {
+        message
+    } else {
+        format!("{code}: {message}")
+    };
+
+    match code.as_str() {
+        "ThrottlingException" | "TooManyRequestsException" | "RequestLimitExceeded" => {
+            CloudShellError::Throttled(detail)
+        }
+        "TokenDecryptionException" => CloudShellError::TokenDecryption(format!(
+            "{detail} (put_credentials requires a console session token; export AWS_* variables over SSM instead)"
+        )),
+        c if c.contains("Quota") || c.contains("LimitExceeded") => CloudShellError::Quota(detail),
+        _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS => CloudShellError::Throttled(detail),
+        _ if status.is_server_error() => CloudShellError::Transient(detail),
+        _ => CloudShellError::Aws {
+            status: status.to_string(),
+            message: detail,
+        },
+    }
 }
 
 /// VPC configuration for environments
@@ -516,23 +640,79 @@ impl VpcConfig {
 
 #[cfg(test)]
 mod retry_tests {
-    use super::{is_retryable_operation, is_retryable_status};
+    use super::*;
 
     #[test]
-    fn retries_only_read_only_operations() {
-        assert!(is_retryable_operation("describeEnvironments"));
-        assert!(is_retryable_operation("getEnvironmentStatus"));
-        assert!(!is_retryable_operation("createEnvironment"));
-        assert!(!is_retryable_operation("createSession"));
+    fn retry_safe_operations_exclude_creates_and_deletes() {
+        assert!(is_retry_safe_operation("describeEnvironments"));
+        assert!(is_retry_safe_operation("sendHeartBeat"));
+        assert!(!is_retry_safe_operation("createEnvironment"));
+        assert!(!is_retry_safe_operation("createSession"));
+        assert!(!is_retry_safe_operation("deleteEnvironment"));
     }
 
     #[test]
-    fn retries_only_transient_http_statuses() {
-        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable_status(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
+    fn throttling_is_retried_for_all_operations() {
+        let err = CloudShellError::Throttled("x".into());
+        assert!(should_retry(&err, false));
+        assert!(should_retry(&err, true));
+    }
+
+    #[test]
+    fn transient_errors_only_retried_when_safe() {
+        let err = CloudShellError::Transient("x".into());
+        assert!(should_retry(&err, true));
+        assert!(!should_retry(&err, false));
+    }
+
+    #[test]
+    fn quota_and_validation_errors_never_retried() {
+        assert!(!should_retry(&CloudShellError::Quota("x".into()), true));
+        assert!(!should_retry(
+            &CloudShellError::Validation("x".into()),
+            true
         ));
-        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        for attempt in 1..=10 {
+            let d = backoff_delay(attempt).as_millis() as u64;
+            assert!(d <= RETRY_MAX_DELAY_MS, "attempt {attempt}: {d}ms");
+        }
+        assert!(backoff_delay(1).as_millis() as u64 <= RETRY_BASE_DELAY_MS);
+    }
+
+    #[test]
+    fn parses_throttling_and_quota_codes() {
+        let body =
+            r#"{"__type":"com.amazonaws.cloudshell#ThrottlingException","message":"slow down"}"#;
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::BAD_REQUEST, body),
+            CloudShellError::Throttled(_)
+        ));
+
+        let body = r#"{"__type":"ServiceQuotaExceededException","message":"200 hours"}"#;
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::BAD_REQUEST, body),
+            CloudShellError::Quota(_)
+        ));
+    }
+
+    #[test]
+    fn maps_http_status_when_no_code() {
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::TOO_MANY_REQUESTS, ""),
+            CloudShellError::Throttled(_)
+        ));
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, ""),
+            CloudShellError::Transient(_)
+        ));
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::BAD_REQUEST, "bad"),
+            CloudShellError::Aws { .. }
+        ));
     }
 }
 

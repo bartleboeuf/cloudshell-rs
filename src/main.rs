@@ -193,6 +193,38 @@ enum Command {
         /// Environment ID
         #[arg(value_name = "ENV_ID")]
         environment_id: String,
+
+        /// Repeat every SECS seconds until the process is stopped (Ctrl+C)
+        #[arg(long, value_name = "SECS")]
+        every: Option<u64>,
+    },
+
+    /// Delete a session in an environment
+    ///
+    /// **Example:**
+    /// ```
+    /// cloudshell-rs delete-session abc123-def4-5678-ghij --session-id 1774205373192206457-cx5s5ruzj
+    /// ```
+    #[command(about = "Delete a session")]
+    DeleteSession {
+        /// Environment ID
+        #[arg(value_name = "ENV_ID")]
+        environment_id: String,
+
+        /// Session ID (from the 'session' command)
+        #[arg(long)]
+        session_id: String,
+    },
+
+    /// Send credentials to an environment (console session token only)
+    ///
+    /// **Note:** The API only accepts console session tokens. Programmatic calls fail
+    /// with TokenDecryptionException. Use 'connect --inject-credentials' instead.
+    #[command(about = "Put credentials into an environment (console-only, usually fails)")]
+    PutCredentials {
+        /// Environment ID
+        #[arg(value_name = "ENV_ID")]
+        environment_id: String,
     },
 
     /// Get S3 presigned URLs for uploading files
@@ -395,9 +427,42 @@ async fn main() -> CloudResult<()> {
             println!("{}", response.pretty_print()?);
         }
 
-        Command::Heartbeat { environment_id } => {
-            client.send_heart_beat(&environment_id).await?;
-            println!("Heartbeat sent to: {}", environment_id);
+        Command::Heartbeat {
+            environment_id,
+            every,
+        } => match every {
+            None => {
+                client.send_heart_beat(&environment_id).await?;
+                println!("Heartbeat sent to: {}", environment_id);
+            }
+            Some(secs) => {
+                let interval = Duration::from_secs(secs.max(1));
+                println!(
+                    "Sending heartbeat to {} every {}s (Ctrl+C to stop)",
+                    environment_id,
+                    interval.as_secs()
+                );
+                loop {
+                    match client.send_heart_beat(&environment_id).await {
+                        Ok(()) => println!("Heartbeat sent to: {}", environment_id),
+                        Err(err) => eprintln!("⚠️  Heartbeat failed: {err}"),
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            }
+        },
+
+        Command::DeleteSession {
+            environment_id,
+            session_id,
+        } => {
+            client.delete_session(&environment_id, &session_id).await?;
+            println!("Session deleted: {}", session_id);
+        }
+
+        Command::PutCredentials { environment_id } => {
+            client.put_credentials(&environment_id).await?;
+            println!("Credentials sent to: {}", environment_id);
         }
 
         Command::Upload { environment_id } => {

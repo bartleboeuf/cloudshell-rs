@@ -1,6 +1,6 @@
 [package]
 name = "cloudshell-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "AWS CloudShell API client and CLI"
 authors = ["Bart LEBOEUF"]
