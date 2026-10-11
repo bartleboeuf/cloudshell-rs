@@ -11,20 +11,19 @@ permissions:
 
 jobs:
   create-release:
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    runs-on: ubuntu-24.04
     steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, reusing it"
+          else
+            gh release create "$TAG" --title "Release $TAG" --generate-notes
+          fi
 
   build:
     needs: create-release
@@ -32,17 +31,17 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             name: linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             name: linux-aarch64
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             name: linux-x86_64-static
             static: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             name: linux-aarch64-static
             static: true
             use_cross: true
@@ -57,7 +56,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -138,26 +137,18 @@ jobs:
           echo "archive_name=${ARCHIVE_FILE}" >> $GITHUB_OUTPUT
           echo "asset_path=${ARCHIVE_FILE}" >> $GITHUB_OUTPUT
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.archive.outputs.asset_path }}
-          asset_name: ${{ steps.archive.outputs.archive_name }}
-          asset_content_type: application/octet-stream
-
       - name: Generate checksum for asset
         shell: bash
-        run: sha256sum ${{ steps.archive.outputs.archive_name }} >> checksums.txt
+        run: sha256sum "${{ steps.archive.outputs.archive_name }}" > "checksums_${{ matrix.name }}.txt"
 
-      - name: Upload checksum
-        uses: actions/upload-release-asset@v1
+      - name: Upload release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: checksums.txt
-          asset_name: checksums_${{ matrix.name }}.txt
-          asset_content_type: text/plain
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          gh release upload "$TAG" \
+            "${{ steps.archive.outputs.archive_name }}" \
+            "checksums_${{ matrix.name }}.txt" \
+            --clobber
