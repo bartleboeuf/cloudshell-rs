@@ -5,7 +5,7 @@
 
 > **Rust library and CLI** for the AWS CloudShell API — reverse-engineered from the AWS Console.
 
-AWS CloudShell has no public SDK. This project provides a **type-safe, high-performance Rust client** using manual SigV4 signing. It's a modern alternative to the Python [cloudshell-boto3](https://github.com/guyon-it-consulting/cloudshell-boto3) project.
+AWS CloudShell has no public SDK. This project provides a **type-safe Rust client** using manual SigV4 signing. It's a modern alternative to the Python [cloudshell-boto3](https://github.com/guyon-it-consulting/cloudshell-boto3) project.
 
 > ⚠️ **Disclaimer** — This uses an undocumented API. AWS can change or break it at any time without notice. Do not build mission-critical systems on top of it.
 
@@ -25,33 +25,32 @@ AWS CloudShell has no public SDK. This project provides a **type-safe, high-perf
 - `PutCredentials` — Forward credentials (console sessions only)
 
 ✨ **Type-Safe Rust Library**
-- Compile-time type safety with `Result<T, E>` error handling
+- Compile-time type safety with a typed error enum (`CloudShellError`) and `CloudResult<T>`
 - Response wrapper types with helper methods
 - No runtime type errors
 - Reusable across projects
 
-🚀 **High Performance**
-- ~5-10 MB memory (vs 60-100 MB Python)
-- ~10ms startup (vs 500ms Python)
-- Static binary (no dependencies needed)
-- Zero-copy async/await
+🚀 **Native Binary**
+- Single compiled binary; no Python runtime required
+- Async I/O on Tokio
+- Request timeouts and bounded retries for read-only calls
 
 📦 **Dual Interface**
 - Library: `CloudShellClient` for embedding in Rust apps
 - CLI: `cloudshell-rs` binary with 10+ subcommands
-- Production-ready examples (full lifecycle, SSM integration)
+- Example programs (full lifecycle, SSM integration)
 
-🧪 **Well-Tested**
-- 63 comprehensive integration tests
-- Input validation (VPC, UUID v4)
-- Edge cases, unicode, complex JSON nesting
-- Tests run in < 100ms
+🧪 **Tested**
+- Unit and integration tests (69 passing, 3 ignored at last run)
+- Input validation (VPC, UUID v4), shell-quoting and retry-policy checks
+- Edge cases and JSON parsing
+- Run with `cargo test`
 
 ---
 
 ## Prerequisites
 
-- **Rust 1.96.0+** ([install](https://rustup.rs/))
+- **Rust 1.99.0+** ([install](https://rustup.rs/))
 - **AWS credentials** configured (profile, env vars, or IAM role)
 - **For SSM integration**: [`session-manager-plugin`](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (optional)
 
@@ -67,7 +66,7 @@ cd cloudshell-rs
 cargo build --release
 ```
 
-The binary is at `target/release/cloudshell-rs` (~3-5 MB).
+The binary is at `target/release/cloudshell-rs`.
 
 ### As a Library
 
@@ -137,7 +136,7 @@ tokio = { version = "1.40", features = ["full"] }
 # Connect to specific environment
 ./target/release/cloudshell-rs connect abc123-def4-5678-ghij
 
-# Auto-inject AWS credentials (silent, secure)
+# Inject AWS credentials into the remote shell (see "Credentials in CloudShell Sessions")
 ./target/release/cloudshell-rs connect --inject-credentials
 
 # Increase environment wait timeout
@@ -166,71 +165,66 @@ tokio = { version = "1.40", features = ["full"] }
 ### Library Usage
 
 ```rust
-use cloudshell_rs::{CloudShellClient, VpcConfig};
+use cloudshell_rs::CloudShellClient;
+use cloudshell_rs::progress::SilentProgress;
+use cloudshell_rs::workflow::{get_or_create_env, wait_for_running};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create client
+async fn main() -> cloudshell_rs::CloudResult<()> {
     let client = CloudShellClient::new(
         "us-east-1".to_string(),
         Some("myprofile".to_string()),
-    ).await?;
+    )
+    .await?;
 
-    // List environments
-    let response = client.describe_environments().await?;
-    println!("{}", response.pretty_print()?);
+    // Find an existing environment, or create a public one (progress goes to `SilentProgress`)
+    let env_id = get_or_create_env(&client, &SilentProgress).await?;
 
-    // Create public environment
-    let create_resp = client.create_environment(Some("my-env"), None).await?;
-    let env_id = create_resp.environment_id().ok_or("No env_id")?;
-    println!("Created: {}", env_id);
+    // Poll until RUNNING (starts a SUSPENDED environment), with a timeout
+    wait_for_running(&client, &env_id, Duration::from_secs(120), &SilentProgress).await?;
 
-    // Alternatively, create VPC environment with validation
-    // let vpc = VpcConfig::new(
-    //     "vpc-0123456789abcdef0".to_string(),
-    //     vec!["subnet-1".to_string()],
-    //     vec!["sg-1".to_string()],
-    // );
-    // let create_resp = client.create_environment(Some("my-vpc-env"), Some(vpc)).await?;
-
-    // Wait for RUNNING state
-    loop {
-        let status = client.get_environment_status(&env_id).await?.status();
-        if status == Some("RUNNING".to_string()) { break; }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-
-    // Create session (TabId automatically validated as UUID v4)
+    // Create a session (TabId is validated as UUID v4)
     let tab_id = Uuid::new_v4().to_string();
-    let session = client.create_session(
-        &env_id,
-        "TMUX",
-        &tab_id,
-        Some(true),
-    ).await?;
-    println!("Stream URL: {}", session.stream_url().ok_or("No URL")?);
+    let session = client
+        .create_session(&env_id, "TMUX", &tab_id, Some(true))
+        .await?;
+    let session_id = session.session_id().unwrap_or_default();
 
     // Get file URLs
     let upload = client.get_file_upload_urls(&env_id).await?;
-    println!("Upload URL: {}", upload.file_upload_presigned_url().unwrap_or_default());
+    println!(
+        "Upload URL: {}",
+        upload.file_upload_presigned_url().unwrap_or_default()
+    );
 
-    // Send heartbeat
+    // Send heartbeat, then clean up the session
     client.send_heart_beat(&env_id).await?;
-
-    // Cleanup
-    client.delete_session(&env_id, session.session_id().as_ref().ok_or("No session_id")?).await?;
-    client.delete_environment(&env_id).await?;
+    client.delete_session(&env_id, &session_id).await?;
 
     Ok(())
 }
+```
+
+`CloudShellError` implements `std::error::Error`, so `?` also works in functions returning `Box<dyn Error>`.
+
+To create a VPC environment instead, build a `VpcConfig` and pass it to `create_environment`:
+
+```rust
+let vpc = VpcConfig::new(
+    "vpc-0123456789abcdef0".to_string(),
+    vec!["subnet-1".to_string()],
+    vec!["sg-1".to_string()],
+);
+let created = client.create_environment(Some("my-vpc-env"), Some(vpc)).await?;
 ```
 
 ---
 
 ## Examples
 
-Two production-ready examples are included:
+Two example programs are included:
 
 ### 1. Full Lifecycle
 
@@ -241,7 +235,7 @@ cargo run --example full_lifecycle -- --profile myprofile --region us-east-1
 ```
 
 **What it does:**
-- Creates/finds environment
+- Creates/finds environment (via the shared `workflow` helpers)
 - Waits for RUNNING state
 - Creates session
 - Gets upload/download presigned URLs
@@ -249,7 +243,7 @@ cargo run --example full_lifecycle -- --profile myprofile --region us-east-1
 - Cleans up session
 - Keeps environment for reuse
 
-**See:** `examples/full_lifecycle.rs` (192 lines)
+**See:** `examples/full_lifecycle.rs`
 
 ### 2. SSM Session Manager Integration
 
@@ -259,8 +253,8 @@ Interactive shell access with AWS Systems Manager:
 # Interactive shell
 cargo run --example connect_via_ssm -- --profile myprofile --region us-east-1
 
-# Auto-inject AWS credentials (silent, secure)
-cargo run --example connect_via_ssm -- --profile myprofile --inject-credentials true
+# Inject AWS credentials (the flag takes no value)
+cargo run --example connect_via_ssm -- --profile myprofile --inject-credentials
 ```
 
 **What it does:**
@@ -271,24 +265,11 @@ cargo run --example connect_via_ssm -- --profile myprofile --inject-credentials 
 
 **Modes:**
 - **Interactive** (default): Full shell access via `session-manager-plugin`. Type `exit` to disconnect
-- **Secure credential injection** (`--inject-credentials`): Silently injects AWS credentials from current profile into the environment (hidden from screen and bash history). Shell is ready immediately for your commands
+- **Credential injection** (`--inject-credentials`): loads the current credentials into the remote bash shell through a temporary file (see [Credentials in CloudShell Sessions](#credentials-in-cloudshell-sessions)). The shell is used once injection is confirmed
 
 **Prerequisites:** `session-manager-plugin` installed ([macOS](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) | [Linux](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html))
 
-**See:** `examples/connect_via_ssm.rs` (180 lines)
-
----
-
-## Performance vs Python
-
-| Metric | Python | Rust | Improvement |
-|--------|--------|------|-------------|
-| **Binary size** | N/A | 3-5 MB | — |
-| **Memory usage** | 60-100 MB | 5-10 MB | **10-20x smaller** |
-| **Startup time** | ~500ms | ~10ms | **50x faster** |
-| **Per-API call** | 5-10ms | 1-5ms | **2-10x faster** |
-| **Type safety** | Runtime errors | Compile-time checks | ✅ |
-| **Static binary** | ❌ | ✅ | ✅ |
+**See:** `examples/connect_via_ssm.rs`
 
 ---
 
@@ -309,8 +290,8 @@ cargo test
 # Run tests with output
 cargo test -- --nocapture
 
-# Lint check
-cargo clippy
+# Lint check (all targets, warnings as errors)
+cargo clippy --all-targets -- -D warnings
 
 # Format code
 cargo fmt
@@ -320,25 +301,23 @@ cargo fmt
 
 ```
 src/
-├── lib.rs          # CloudShellClient library (607 lines)
+├── lib.rs          # CloudShellClient, CloudShellError, CloudResult, VpcConfig, response types
 │                   #   - 12 API operations
-│                   #   - VpcConfig with validation
-│                   #   - 7 response wrapper types
-└── main.rs         # CLI with 11 subcommands (688 lines)
+│                   #   - Retry policy and unit tests
+├── workflow.rs     # get_or_create_env, wait_for_running (shared by CLI and examples)
+├── ssm.rs          # connect_via_ssm, check_session_manager_plugin, credential loading
+│                   #   - Unit tests for shell quoting
+├── progress.rs     # Progress trait, StdoutProgress, SilentProgress
+└── main.rs         # CLI subcommands (thin wrapper over the library)
                     #   - Comprehensive help text
                     #   - VPC environment support
-                    #   - Input validation
 
 examples/
 ├── full_lifecycle.rs        # Complete workflow demo
 └── connect_via_ssm.rs       # SSM integration demo
 
 tests/
-└── integration_tests.rs    # 63 comprehensive tests
-                            #   - Response types (24 tests)
-                            #   - Input validation (10 tests)
-                            #   - Edge cases (29 tests)
-
+└── integration_tests.rs    # Integration tests (response types, VPC and UUID validation, edge cases)
 ```
 
 ### Key Dependencies
@@ -348,6 +327,7 @@ tests/
 | `aws-config` | AWS credential resolution |
 | `aws-sigv4` | SigV4 request signing |
 | `reqwest` | Async HTTP client |
+| `aws-smithy-runtime` | Provides the default HTTPS client used by `aws-config` (required at runtime) |
 | `tokio` | Async runtime |
 | `clap` | CLI argument parsing |
 | `serde_json` | JSON serialization |
@@ -359,43 +339,64 @@ tests/
 
 ### CloudShellClient Methods
 
-All methods are async and return `Result<T, Box<dyn std::error::Error>>`:
+All methods are async and return `CloudResult<T>`, which is `Result<T, CloudShellError>`. `CloudShellError` implements `std::error::Error`, so `?` also works in functions returning `Box<dyn Error>`:
 
 ```rust
 // Environment management
-pub async fn describe_environments(&self) -> Result<DescribeEnvironmentsResponse, ...>
-pub async fn create_environment(&self, name: Option<&str>, vpc: Option<VpcConfig>) 
-    -> Result<CreateEnvironmentResponse, ...>
-pub async fn get_environment_status(&self, env_id: &str) 
-    -> Result<EnvironmentStatusResponse, ...>
-pub async fn start_environment(&self, env_id: &str) -> Result<(), ...>
-pub async fn stop_environment(&self, env_id: &str) -> Result<StopEnvironmentResponse, ...>
-pub async fn delete_environment(&self, env_id: &str) -> Result<(), ...>
+pub async fn describe_environments(&self) -> CloudResult<DescribeEnvironmentsResponse>
+pub async fn create_environment(&self, name: Option<&str>, vpc: Option<VpcConfig>)
+    -> CloudResult<CreateEnvironmentResponse>
+pub async fn get_environment_status(&self, env_id: &str) -> CloudResult<EnvironmentStatusResponse>
+pub async fn start_environment(&self, env_id: &str) -> CloudResult<()>
+pub async fn stop_environment(&self, env_id: &str) -> CloudResult<StopEnvironmentResponse>
+pub async fn delete_environment(&self, env_id: &str) -> CloudResult<()>
 
 // Session management
-pub async fn create_session(&self, env_id: &str, session_type: &str, tab_id: &str, 
-    q_cli_disabled: Option<bool>) -> Result<CreateSessionResponse, ...>
-pub async fn delete_session(&self, env_id: &str, session_id: &str) -> Result<(), ...>
+pub async fn create_session(&self, env_id: &str, session_type: &str, tab_id: &str,
+    q_cli_disabled: Option<bool>) -> CloudResult<CreateSessionResponse>
+pub async fn delete_session(&self, env_id: &str, session_id: &str) -> CloudResult<()>
 
 // Heartbeat
-pub async fn send_heart_beat(&self, env_id: &str) -> Result<(), ...>
+pub async fn send_heart_beat(&self, env_id: &str) -> CloudResult<()>
 
 // File transfer
-pub async fn get_file_upload_urls(&self, env_id: &str) 
-    -> Result<FileTransferResponse, ...>
-pub async fn get_file_download_urls(&self, env_id: &str) 
-    -> Result<FileTransferResponse, ...>
+pub async fn get_file_upload_urls(&self, env_id: &str) -> CloudResult<FileTransferResponse>
+pub async fn get_file_download_urls(&self, env_id: &str) -> CloudResult<FileTransferResponse>
 
 // Credentials (console sessions only)
-pub async fn put_credentials(&self, env_id: &str) -> Result<(), ...>
+pub async fn put_credentials(&self, env_id: &str) -> CloudResult<()>
 ```
+
+### Workflow, SSM and Progress Helpers
+
+These shared helpers are used by the CLI and the examples. They are public so you can reuse them.
+
+```rust
+// cloudshell_rs::workflow
+pub async fn get_or_create_env(client: &CloudShellClient, progress: &dyn Progress) -> CloudResult<String>
+pub async fn wait_for_running(client: &CloudShellClient, env_id: &str,
+    timeout: Duration, progress: &dyn Progress) -> CloudResult<()>
+
+// cloudshell_rs::ssm
+pub fn check_session_manager_plugin() -> bool
+pub async fn connect_via_ssm(client: &CloudShellClient, env_id: &str, session_id: &str,
+    payload: &str, region: &str, inject_credentials: bool,
+    progress: &dyn Progress) -> CloudResult<()>
+
+// cloudshell_rs::progress
+pub trait Progress { fn info(&self, message: &str); }
+pub struct StdoutProgress;  // prints messages (used by the CLI and examples)
+pub struct SilentProgress;  // discards messages
+```
+
+The library does not print on its own. Pass `&SilentProgress` to run quietly, or implement `Progress` to route messages to your own logger. Output from `session-manager-plugin` itself is always shown on the terminal.
 
 ### VpcConfig
 
 For creating VPC environments with input validation:
 
 ```rust
-// Create with validation (panics if invalid)
+// Construct; create_environment() validates it before calling the API
 let vpc = VpcConfig::new(
     "vpc-0123456789abcdef0".to_string(),
     vec!["subnet-1".to_string(), "subnet-2".to_string()],
@@ -421,8 +422,8 @@ match vpc.validate() {
 **Validation rules:**
 - Min 1 subnet required
 - Max 5 security groups allowed
-- `VpcConfig::new()` panics on invalid config (fail-fast)
-- `VpcConfig::validate()` returns Result for error handling
+- `VpcConfig::new()` does not validate. Invalid input is reported by `validate()` (returns `Result<(), String>`) and by `create_environment()` as `CloudShellError::Validation`
+- VPC ID, subnet IDs and security group IDs must not be blank
 
 ### Response Types
 
@@ -535,6 +536,8 @@ CloudShell uses the `rest-json` protocol — operations are routed by **URI path
 4. Parse JSON response
 5. Return typed response wrapper
 
+**Timeouts and retries:** every request has a 30-second timeout. Read-only calls (`DescribeEnvironments`, `GetEnvironmentStatus`) retry up to 3 attempts on connection or timeout errors and on HTTP 429/5xx responses. Mutating calls (create, start, stop, session, delete, heartbeat) are never retried, to avoid duplicate side effects.
+
 **Why manual signing?**
 
 Standard AWS SDKs may not support the CloudShell service definition, so this project uses the `aws-sigv4` crate for direct request signing. This gives full control over the request format.
@@ -543,9 +546,8 @@ Standard AWS SDKs may not support the CloudShell service definition, so this pro
 
 ## Limits
 
-- **Max 2 VPC environments** per IAM principal
-- **Max 5 security groups** per VPC environment
-- **~1 GB storage** per environment per region
+- **Max 5 security groups** per VPC environment (enforced by the client before the API call)
+- Other quotas (VPC environment count, storage) are set by AWS and may change; check the CloudShell documentation
 - Environments **auto-sleep** after inactivity (use heartbeats to prevent)
 - Environments can be **reclaimed by AWS** without notice
 
@@ -553,27 +555,25 @@ Standard AWS SDKs may not support the CloudShell service definition, so this pro
 
 ## Credentials in CloudShell Sessions
 
-When using the `connect` command with `--inject-credentials`, AWS credentials are automatically extracted from your current AWS profile and injected as environment variables into the CloudShell session. This enables AWS CLI commands to work without additional setup.
+`connect --inject-credentials` loads the credentials of the active profile (or `--profile`) into the remote bash shell, so AWS CLI commands work without extra setup.
 
-**Automatic credential injection:**
 ```bash
 ./target/release/cloudshell-rs connect --inject-credentials
 ```
 
-This will:
-1. Extract credentials from your current AWS profile (or `--profile` if specified)
-2. **Silently inject** them as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`
-3. Make credentials **read-only** to prevent accidental exposure
-4. Hide all injections from terminal output and bash history
+**What happens:**
+1. Echo and shell history are turned off in the remote shell.
+2. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` (if present) and `AWS_DEFAULT_REGION` are written to a mode-`600` file in `/dev/shm` (RAM-backed), with values shell-quoted.
+3. The file is sourced and deleted immediately. History and echo are restored.
+4. The CLI waits for a marker confirming the setup ran, instead of fixed delays.
+5. A `trap` unsets the variables when the shell exits.
 
-**Security features:**
-- ✅ Terminal echo disabled during injection (credentials never appear on screen)
-- ✅ Leading space prefix prevents bash history recording
-- ✅ Bash history disabled during setup (`HISTCONTROL=ignorespace`, `set +o history`)
-- ✅ Credentials marked as `readonly` (prevents `echo $AWS_*`)
-- ✅ Screen cleared after injection to remove visual traces
-
-The credentials are passed securely through the SSM Session Manager session with maximum protection against exposure.
+**Limitations:**
+- The secrets are still typed into the SSM input stream. If SSM session logging is enabled for the account, the commands may be recorded.
+- Requires bash in the environment.
+- If the active profile uses long-term access keys, those are injected. Prefer short-lived credentials (for example, from `sts:AssumeRole`).
+- Credentials are held as plain strings in CLI memory and are not zeroized.
+- If injection fails, the CLI stops the plugin and deletes the session before returning the error.
 
 ---
 

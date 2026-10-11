@@ -716,9 +716,8 @@ fn test_vpc_config_validate_no_subnets() {
 }
 
 #[test]
-#[should_panic(expected = "Max 5 security groups")]
-fn test_vpc_config_new_panics_on_too_many_security_groups() {
-    VpcConfig::new(
+fn test_vpc_config_new_does_not_panic_on_invalid_security_groups() {
+    let vpc = VpcConfig::new(
         "vpc-123".to_string(),
         vec!["subnet-1".to_string()],
         vec![
@@ -730,6 +729,19 @@ fn test_vpc_config_new_panics_on_too_many_security_groups() {
             "sg-6".to_string(),
         ],
     );
+
+    assert!(vpc.validate().is_err());
+}
+
+#[test]
+fn test_vpc_config_validate_rejects_blank_ids() {
+    let vpc = VpcConfig::new(
+        " ".to_string(),
+        vec!["subnet-1".to_string()],
+        vec!["sg-1".to_string()],
+    );
+
+    assert!(vpc.validate().unwrap_err().contains("VPC ID"));
 }
 
 #[test]

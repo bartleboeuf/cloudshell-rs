@@ -1,38 +1,37 @@
 [package]
 name = "cloudshell-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
-description = "SSM Client for the AWS CloudShell API"
+description = "AWS CloudShell API client and CLI"
 authors = ["Bart LEBOEUF"]
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/bartleboeuf/cloudshell-rs"
 repository = "https://github.com/bartleboeuf/cloudshell-rs"
-rust-version = "1.96.0"  # Specify minimum Rust version
+rust-version = "1.99.0"  # Specify minimum Rust version
 categories = ["development-tools", "command-line-utilities"]
-keywords = ["aws", "aws-sdk-ssm"]
+keywords = ["aws", "cloudshell", "cli"]
+publish = false
 
 [dependencies]
-aws-config = { version = "1.8.18", features = ["behavior-version-latest"], default-features = false }
-aws-credential-types = { version = "1.2.14", default-features = false }
-aws-sdk-iam = { version = "1.113.0", default-features = false }
-aws-sdk-sts = { version = "1.107.0", default-features = false }
-aws-sdk-ssm = { version = "1.113.0", default-features = false }
-aws-smithy-runtime = { version = "1.11.3", default-features = false }
-aws-sigv4 = { version = "1.4.5", features = ["http0-compat"], default-features = false }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time"], default-features = false }
-serde_json = { version = "1.0", default-features = false }
-reqwest = { version = "0.13.4", features = ["json"], default-features = false }
+aws-config = { version = "1.12.0", features = ["behavior-version-latest", "sso"], default-features = false }
+aws-credential-types = { version = "1.3.0", default-features = false }
+aws-sigv4 = { version = "1.6.0", features = ["http0-compat"], default-features = false }
+aws-smithy-async = { version = "1.3.0", default-features = false, features = ["rt-tokio"] }
+# Required at runtime: provides the default HTTPS client used by aws-config.
+aws-smithy-runtime = { version = "1.16.0", default-features = false, features = ["default-https-client"] }
 clap = { version = "4.6", features = ["derive"] }
-http = { version = "1.4", default-features = false }
-uuid = { version = "1.23", features = ["v4"], default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
+reqwest = { version = "0.13.5", features = ["json", "rustls"], default-features = false }
+serde_json = { version = "1.0", default-features = false }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"], default-features = false }
+uuid = { version = "1.28", features = ["v4"], default-features = false }
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
 opt-level = 3
 
 # Optimize dependencies for release builds
@@ -47,11 +46,6 @@ debug = true
 overflow-checks = true
 incremental = true
 
-# selectively optimize only the heaviest crates:
-[profile.dev.package.aws-sdk-ssm]
-opt-level = 2
-
-# Speed up dev builds by reducing optimization on deps
 [profile.dev.package."*"]
 opt-level = 1
 debug = false

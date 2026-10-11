@@ -1,12 +1,10 @@
 use clap::{Parser, Subcommand};
-use cloudshell_rs::{CloudShellClient, VpcConfig};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use cloudshell_rs::progress::StdoutProgress;
+use cloudshell_rs::ssm::{check_session_manager_plugin, connect_via_ssm};
+use cloudshell_rs::workflow::{get_or_create_env, wait_for_running};
+use cloudshell_rs::{CloudResult, CloudShellClient, CloudShellError, VpcConfig};
 use serde_json::json;
-use std::io::Write;
-use std::process::{Command as ProcessCommand, Stdio};
-use std::thread;
 use std::time::Duration;
-use tokio::time::sleep;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -287,218 +285,8 @@ enum Command {
     },
 }
 
-/// Check if session-manager-plugin is available
-fn check_session_manager_plugin() -> bool {
-    ProcessCommand::new("session-manager-plugin")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-/// Get existing environment or create a new one
-async fn get_or_create_env(
-    client: &CloudShellClient,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let envs = client.describe_environments().await?.environments();
-
-    if !envs.is_empty() {
-        let env_id = envs[0]
-            .get("EnvironmentId")
-            .and_then(|id| id.as_str())
-            .ok_or("No EnvironmentId in response")?;
-
-        println!("📍 Found existing environment: {}", env_id);
-        return Ok(env_id.to_string());
-    }
-
-    println!("✨ No environment found, creating...");
-    let create_resp = client.create_environment(None, None).await?;
-    let env_id = create_resp
-        .environment_id()
-        .ok_or("No environment ID in create response")?;
-
-    println!("✅ Created environment: {}", env_id);
-    Ok(env_id)
-}
-
-/// Wait for environment to reach RUNNING state
-async fn wait_for_running(
-    client: &CloudShellClient,
-    env_id: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-
-    loop {
-        let status_resp = client.get_environment_status(env_id).await?;
-        let status = status_resp.status().ok_or("No status in response")?;
-
-        if status == "RUNNING" {
-            return Ok(());
-        }
-
-        // Start suspended environment
-        if status == "SUSPENDED" {
-            println!("🔄 Environment is SUSPENDED, starting...");
-            client.start_environment(env_id).await?;
-        }
-
-        // Check timeout
-        if start.elapsed() > timeout {
-            return Err(format!("Timeout: Environment stuck in {} state", status).into());
-        }
-
-        println!("⏳ Status: {} - waiting...", status);
-        sleep(Duration::from_secs(3)).await;
-    }
-}
-
-/// Connect to CloudShell environment via session-manager-plugin
-async fn connect_via_ssm(
-    client: &CloudShellClient,
-    env_id: &str,
-    session_id: &str,
-    payload: &str,
-    region: &str,
-    inject_credentials: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if inject_credentials {
-        // Inject credentials mode: set env vars, verify with test commands, then go interactive
-        // Enable raw mode for proper terminal handling (backspace, arrow keys, etc.)
-        enable_raw_mode()?;
-
-        let result = {
-            let mut child = ProcessCommand::new("session-manager-plugin")
-                .arg(payload)
-                .arg(region)
-                .arg("StartSession")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()?;
-
-            let mut stdin = child.stdin.take().ok_or("Failed to open stdin")?;
-
-            // Wait for shell to be ready
-            println!("⏳ Waiting for shell to be ready...");
-            sleep(Duration::from_secs(3)).await;
-
-            println!("💉 Injecting AWS credentials...");
-
-            // Get current credentials from the client
-            let creds = client.get_credentials();
-            let access_key = creds.access_key_id();
-            let secret_key = creds.secret_access_key();
-            let session_token = creds.session_token();
-
-            // Disable echo to hide credential exports from screen
-            writeln!(stdin, "stty -echo")?;
-            sleep(Duration::from_millis(500)).await;
-
-            // Build commands: secure credential injection
-            let mut commands = vec![
-                " set +o history".to_string(),
-                " export HISTFILE=/dev/null".to_string(),
-                " export HISTCONTROL=ignorespace".to_string(),
-                format!(" export AWS_ACCESS_KEY_ID={}", access_key),
-                format!(" export AWS_SECRET_ACCESS_KEY={}", secret_key),
-            ];
-
-            if let Some(token) = session_token {
-                commands.push(format!(" export AWS_SESSION_TOKEN={}", token));
-            }
-
-            commands.extend(vec![
-                format!(" export AWS_DEFAULT_REGION={}", region),
-                " readonly AWS_ACCESS_KEY_ID".to_string(),
-                " readonly AWS_SECRET_ACCESS_KEY".to_string(),
-                " readonly AWS_SESSION_TOKEN".to_string(),
-                " clear".to_string(),
-                " set -o history".to_string(),
-            ]);
-
-            // Send credentials without displaying them
-            for cmd in &commands {
-                writeln!(stdin, "{}", cmd)?;
-                sleep(Duration::from_millis(500)).await;
-            }
-
-            // Re-enable echo and confirm completion
-            writeln!(stdin, "stty echo")?;
-            sleep(Duration::from_millis(500)).await;
-
-            println!("✅ Connected! Shell is open (type 'exit' to disconnect)");
-
-            // Forward user input to subprocess as raw bytes (not line-buffered)
-            thread::spawn(move || {
-                use std::io::Read;
-                let mut buf = [0u8; 256];
-                let stdin_fd = std::io::stdin();
-                let mut stdin_lock = stdin_fd.lock();
-                loop {
-                    match stdin_lock.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = stdin.write_all(&buf[..n]);
-                            let _ = stdin.flush();
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-
-            // Wait for user to finish
-            child.wait()?
-        };
-
-        // Always restore terminal to normal mode
-        disable_raw_mode()?;
-
-        if !result.success() {
-            return Err("session-manager-plugin exited with error".into());
-        }
-    } else {
-        // Interactive mode: inherit stdin from parent process (keeps it open)
-        println!("⏳ Waiting for shell to be ready...");
-        sleep(Duration::from_secs(3)).await;
-
-        println!("🔓 Interactive shell ready!");
-        println!("💡 Type 'exit' to disconnect");
-        println!("📝 Session Info:");
-        println!("   Environment ID: {}", env_id);
-        println!("   Session ID: {}", session_id);
-
-        // Enable raw mode for proper terminal handling (backspace, arrow keys, etc.)
-        enable_raw_mode()?;
-        let result = {
-            let mut child = ProcessCommand::new("session-manager-plugin")
-                .arg(payload)
-                .arg(region)
-                .arg("StartSession")
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()?;
-
-            // Wait indefinitely for subprocess (user will exit shell manually)
-            child.wait()?
-        };
-        // Always restore terminal to normal mode
-        disable_raw_mode()?;
-
-        if !result.success() {
-            return Err("session-manager-plugin exited with error".into());
-        }
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> CloudResult<()> {
     let args = Args::parse();
 
     // Create CloudShell client (clone region for later use in connect command)
@@ -520,27 +308,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let vpc_config = if let Some(vpc_id) = vpc_id {
                 // VPC environment: require subnet and security groups
                 let subnets = subnet_ids
-                    .ok_or("--subnet-ids required when --vpc-id is provided")?
+                    .ok_or_else(|| {
+                        CloudShellError::Validation(
+                            "--subnet-ids required when --vpc-id is provided".to_string(),
+                        )
+                    })?
                     .split(',')
                     .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>();
 
                 let security_groups = security_group_ids
-                    .ok_or("--security-group-ids required when --vpc-id is provided")?
+                    .ok_or_else(|| {
+                        CloudShellError::Validation(
+                            "--security-group-ids required when --vpc-id is provided".to_string(),
+                        )
+                    })?
                     .split(',')
                     .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>();
 
                 // Validate: at least 1 subnet, max 5 security groups
                 if subnets.is_empty() {
-                    return Err("At least 1 subnet is required".into());
+                    return Err(CloudShellError::Validation(
+                        "At least 1 subnet is required".to_string(),
+                    ));
+                }
+                if security_groups.is_empty() {
+                    return Err(CloudShellError::Validation(
+                        "At least 1 security group is required".to_string(),
+                    ));
                 }
                 if security_groups.len() > 5 {
-                    return Err(format!(
+                    return Err(CloudShellError::Validation(format!(
                         "Max 5 security groups allowed, got {}",
                         security_groups.len()
-                    )
-                    .into());
+                    )));
                 }
 
                 Some(VpcConfig::new(vpc_id, subnets, security_groups))
@@ -617,7 +421,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!(
                     "   Install from: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
                 );
-                return Err("session-manager-plugin is required".into());
+                return Err(CloudShellError::Process(
+                    "session-manager-plugin is required".to_string(),
+                ));
             }
             println!("✅ session-manager-plugin found");
 
@@ -629,13 +435,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id
             } else {
                 println!("\n📋 Looking for existing environments...");
-                get_or_create_env(&client).await?
+                get_or_create_env(&client, &StdoutProgress).await?
             };
             println!("✅ Environment: {}", env_id);
 
             // Step 2: Wait for environment to be running
             println!("\n⏳ Waiting for environment to be RUNNING...");
-            wait_for_running(&client, &env_id, Duration::from_secs(timeout_secs)).await?;
+            wait_for_running(
+                &client,
+                &env_id,
+                Duration::from_secs(timeout_secs),
+                &StdoutProgress,
+            )
+            .await?;
             println!("✅ Environment is ready!");
 
             // Step 3: Create a session
@@ -645,13 +457,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .create_session(&env_id, "TMUX", &tab_id, Some(true))
                 .await?;
 
-            let session_id = session_resp
-                .session_id()
-                .ok_or("No session ID in response")?;
-            let token_value = session_resp.token_value().ok_or("No token in response")?;
-            let stream_url = session_resp
-                .stream_url()
-                .ok_or("No stream URL in response")?;
+            let session_id = session_resp.session_id().ok_or_else(|| {
+                CloudShellError::Response("No session ID in response".to_string())
+            })?;
+            let token_value = session_resp
+                .token_value()
+                .ok_or_else(|| CloudShellError::Response("No token in response".to_string()))?;
+            let stream_url = session_resp.stream_url().ok_or_else(|| {
+                CloudShellError::Response("No stream URL in response".to_string())
+            })?;
 
             println!("✅ Session created: {}", session_id);
             println!("📡 Stream URL: {}", stream_url);
@@ -664,20 +478,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "StreamUrl": stream_url,
             });
 
-            connect_via_ssm(
+            let connect_result = connect_via_ssm(
                 &client,
                 &env_id,
                 &session_id,
                 &payload.to_string(),
                 &args.region,
                 inject_credentials,
+                &StdoutProgress,
             )
-            .await?;
+            .await;
 
-            // Step 5: Cleanup
+            // Step 5: Cleanup, runs even if the connection failed
             println!("\n🧹 Cleaning up...");
-            client.delete_session(&env_id, &session_id).await?;
-            println!("✅ Session deleted");
+            match client.delete_session(&env_id, &session_id).await {
+                Ok(()) => println!("✅ Session deleted"),
+                Err(err) => eprintln!("⚠️  Failed to delete session {}: {}", session_id, err),
+            }
+            connect_result?;
 
             println!("\n✨ CloudShell session complete!");
             println!("💡 Tip: Environment kept for reuse (use 'delete' command to remove it)");

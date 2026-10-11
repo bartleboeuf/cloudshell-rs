@@ -4,8 +4,9 @@
 /// Usage:
 ///   cargo run --example full_lifecycle -- --profile your-profile --region us-east-1
 use cloudshell_rs::CloudShellClient;
+use cloudshell_rs::progress::StdoutProgress;
+use cloudshell_rs::workflow::{get_or_create_env, wait_for_running};
 use std::time::Duration;
-use tokio::time::sleep;
 use uuid::Uuid;
 
 #[derive(clap::Parser)]
@@ -33,12 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 1: Find or create environment
     println!("\n📋 Looking for existing environments...");
-    let env_id = get_or_create_env(&client).await?;
+    let env_id = get_or_create_env(&client, &StdoutProgress).await?;
     println!("✅ Using environment: {}", env_id);
 
     // Step 2: Wait for environment to be running
     println!("\n⏳ Waiting for environment to be RUNNING...");
-    wait_for_running(&client, &env_id, Duration::from_secs(args.timeout_secs)).await?;
+    wait_for_running(
+        &client,
+        &env_id,
+        Duration::from_secs(args.timeout_secs),
+        &StdoutProgress,
+    )
+    .await?;
     println!("✅ Environment is ready!");
 
     // Step 3: Create a session
@@ -146,62 +153,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("💡 Tip: Environment kept for reuse (call 'delete' to remove it)");
 
     Ok(())
-}
-
-/// Get existing environment or create a new one
-async fn get_or_create_env(
-    client: &CloudShellClient,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let envs = client.describe_environments().await?.environments();
-
-    if !envs.is_empty() {
-        let env_id = envs[0]
-            .get("EnvironmentId")
-            .and_then(|id| id.as_str())
-            .ok_or("No EnvironmentId in response")?;
-
-        println!("📍 Found existing environment: {}", env_id);
-        return Ok(env_id.to_string());
-    }
-
-    println!("✨ No environment found, creating...");
-    let create_resp = client.create_environment(None, None).await?;
-    let env_id = create_resp
-        .environment_id()
-        .ok_or("No environment ID in create response")?;
-
-    println!("✅ Created environment: {}", env_id);
-    Ok(env_id)
-}
-
-/// Wait for environment to reach RUNNING state
-async fn wait_for_running(
-    client: &CloudShellClient,
-    env_id: &str,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let start = std::time::Instant::now();
-
-    loop {
-        let status_resp = client.get_environment_status(env_id).await?;
-        let status = status_resp.status().ok_or("No status in response")?;
-
-        if status == "RUNNING" {
-            return Ok(());
-        }
-
-        // Start suspended environment
-        if status == "SUSPENDED" {
-            println!("🔄 Environment is SUSPENDED, starting...");
-            client.start_environment(env_id).await?;
-        }
-
-        // Check timeout
-        if start.elapsed() > timeout {
-            return Err(format!("Timeout: Environment stuck in {} state", status).into());
-        }
-
-        println!("⏳ Status: {} - waiting...", status);
-        sleep(Duration::from_secs(3)).await;
-    }
 }

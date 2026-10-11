@@ -3,36 +3,105 @@ use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{
     SignableBody, SignableRequest, SigningParams, SigningSettings, sign,
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+pub mod progress;
+pub mod ssm;
+pub mod workflow;
+
+#[derive(Debug, Clone)]
+pub enum CloudShellError {
+    Config(String),
+    Credential(String),
+    Validation(String),
+    Json(String),
+    Request(String),
+    Network(String),
+    Aws { status: String, message: String },
+    InvalidUuid(String),
+    Io(String),
+    Process(String),
+    Response(String),
+    Timeout(String),
+}
+
+impl std::fmt::Display for CloudShellError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(message)
+            | Self::Credential(message)
+            | Self::Validation(message)
+            | Self::Json(message)
+            | Self::Request(message)
+            | Self::Network(message)
+            | Self::InvalidUuid(message)
+            | Self::Io(message)
+            | Self::Process(message)
+            | Self::Response(message)
+            | Self::Timeout(message) => write!(f, "{message}"),
+            Self::Aws { status, message } => write!(f, "AWS request failed ({status}): {message}"),
+        }
+    }
+}
+
+impl std::error::Error for CloudShellError {}
+
+impl From<serde_json::Error> for CloudShellError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err.to_string())
+    }
+}
+
+impl From<reqwest::Error> for CloudShellError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Network(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for CloudShellError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err.to_string())
+    }
+}
+
+pub type CloudResult<T> = std::result::Result<T, CloudShellError>;
 
 /// CloudShell API client for AWS CloudShell operations
 pub struct CloudShellClient {
     region: String,
     credentials: aws_credential_types::Credentials,
+    http_client: reqwest::Client,
 }
 
 impl CloudShellClient {
     /// Create a new CloudShell client with credentials from AWS configuration
-    pub async fn new(
-        region: String,
-        profile: Option<String>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new(region: String, profile: Option<String>) -> CloudResult<Self> {
         // Load AWS configuration with optional profile
-        let mut config_builder = aws_config::defaults(BehaviorVersion::latest());
+        let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
+            .sleep_impl(aws_smithy_async::rt::sleep::TokioSleep::new());
         if let Some(profile) = profile {
             config_builder = config_builder.profile_name(&profile);
         }
         let config = config_builder.load().await;
 
         // Get credentials
-        let credentials_provider = config
-            .credentials_provider()
-            .ok_or("No credentials provider available")?;
-        let credentials = credentials_provider.provide_credentials().await?;
+        let credentials_provider = config.credentials_provider().ok_or_else(|| {
+            CloudShellError::Config("No credentials provider available".to_string())
+        })?;
+        let credentials = credentials_provider
+            .provide_credentials()
+            .await
+            .map_err(|err| CloudShellError::Credential(err.to_string()))?;
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|err| CloudShellError::Config(err.to_string()))?;
 
         Ok(CloudShellClient {
             region,
             credentials,
+            http_client,
         })
     }
 
@@ -42,12 +111,10 @@ impl CloudShellClient {
     }
 
     /// Describe all CloudShell environments
-    pub async fn describe_environments(
-        &self,
-    ) -> Result<DescribeEnvironmentsResponse, Box<dyn std::error::Error>> {
-        let response = self.call_api("describeEnvironments", b"{}").await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
-
+    pub async fn describe_environments(&self) -> CloudResult<DescribeEnvironmentsResponse> {
+        let json = self
+            .call_api_json("describeEnvironments", &serde_json::json!({}))
+            .await?;
         Ok(DescribeEnvironmentsResponse { raw_response: json })
     }
 
@@ -75,12 +142,15 @@ impl CloudShellClient {
         &self,
         environment_name: Option<&str>,
         vpc_config: Option<VpcConfig>,
-    ) -> Result<CreateEnvironmentResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<CreateEnvironmentResponse> {
         let mut body = serde_json::json!({});
         if let Some(name) = environment_name {
             body["EnvironmentName"] = serde_json::json!(name);
         }
-        if let Some(vpc) = vpc_config {
+        if let Some(vpc) = &vpc_config {
+            vpc.validate().map_err(|err| {
+                CloudShellError::Validation(format!("Invalid VPC configuration: {err}"))
+            })?;
             body["VpcConfig"] = serde_json::json!({
                 "VpcId": vpc.vpc_id,
                 "SubnetIds": vpc.subnet_ids,
@@ -88,22 +158,15 @@ impl CloudShellClient {
             });
         }
 
-        let response = self
-            .call_api("createEnvironment", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("createEnvironment", &body).await?;
 
         Ok(CreateEnvironmentResponse { raw_response: json })
     }
 
     /// Start a CloudShell environment
-    pub async fn start_environment(
-        &self,
-        environment_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start_environment(&self, environment_id: &str) -> CloudResult<()> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        self.call_api("startEnvironment", body.to_string().as_bytes())
-            .await?;
+        self.call_api("startEnvironment", &body).await?;
         Ok(())
     }
 
@@ -111,12 +174,9 @@ impl CloudShellClient {
     pub async fn stop_environment(
         &self,
         environment_id: &str,
-    ) -> Result<StopEnvironmentResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<StopEnvironmentResponse> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        let response = self
-            .call_api("stopEnvironment", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("stopEnvironment", &body).await?;
 
         Ok(StopEnvironmentResponse { raw_response: json })
     }
@@ -125,12 +185,9 @@ impl CloudShellClient {
     pub async fn get_environment_status(
         &self,
         environment_id: &str,
-    ) -> Result<EnvironmentStatusResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<EnvironmentStatusResponse> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        let response = self
-            .call_api("getEnvironmentStatus", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("getEnvironmentStatus", &body).await?;
 
         Ok(EnvironmentStatusResponse { raw_response: json })
     }
@@ -158,10 +215,13 @@ impl CloudShellClient {
         session_type: &str,
         tab_id: &str,
         q_cli_disabled: Option<bool>,
-    ) -> Result<CreateSessionResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<CreateSessionResponse> {
         // Validate tab_id is a valid UUID
         if uuid::Uuid::parse_str(tab_id).is_err() {
-            return Err(format!("Invalid TabId: '{}' is not a valid UUID", tab_id).into());
+            return Err(CloudShellError::InvalidUuid(format!(
+                "Invalid TabId: '{}' is not a valid UUID",
+                tab_id
+            )));
         }
 
         let mut body = serde_json::json!({
@@ -173,48 +233,32 @@ impl CloudShellClient {
             body["QCliDisabled"] = serde_json::json!(disabled);
         }
 
-        let response = self
-            .call_api("createSession", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("createSession", &body).await?;
 
         Ok(CreateSessionResponse { raw_response: json })
     }
 
     /// Send a heartbeat to keep a CloudShell environment alive
-    pub async fn send_heart_beat(
-        &self,
-        environment_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn send_heart_beat(&self, environment_id: &str) -> CloudResult<()> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        self.call_api("sendHeartBeat", body.to_string().as_bytes())
-            .await?;
+        self.call_api("sendHeartBeat", &body).await?;
         Ok(())
     }
 
     /// Delete a CloudShell session
-    pub async fn delete_session(
-        &self,
-        environment_id: &str,
-        session_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn delete_session(&self, environment_id: &str, session_id: &str) -> CloudResult<()> {
         let body = serde_json::json!({
             "EnvironmentId": environment_id,
             "SessionId": session_id,
         });
-        self.call_api("deleteSession", body.to_string().as_bytes())
-            .await?;
+        self.call_api("deleteSession", &body).await?;
         Ok(())
     }
 
     /// Delete a CloudShell environment
-    pub async fn delete_environment(
-        &self,
-        environment_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn delete_environment(&self, environment_id: &str) -> CloudResult<()> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        self.call_api("deleteEnvironment", body.to_string().as_bytes())
-            .await?;
+        self.call_api("deleteEnvironment", &body).await?;
         Ok(())
     }
 
@@ -222,12 +266,9 @@ impl CloudShellClient {
     pub async fn get_file_upload_urls(
         &self,
         environment_id: &str,
-    ) -> Result<FileTransferResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<FileTransferResponse> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        let response = self
-            .call_api("getFileUploadUrls", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("getFileUploadUrls", &body).await?;
 
         Ok(FileTransferResponse { raw_response: json })
     }
@@ -236,33 +277,31 @@ impl CloudShellClient {
     pub async fn get_file_download_urls(
         &self,
         environment_id: &str,
-    ) -> Result<FileTransferResponse, Box<dyn std::error::Error>> {
+    ) -> CloudResult<FileTransferResponse> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        let response = self
-            .call_api("getFileDownloadUrls", body.to_string().as_bytes())
-            .await?;
-        let json: serde_json::Value = serde_json::from_str(&response)?;
+        let json = self.call_api_json("getFileDownloadUrls", &body).await?;
 
         Ok(FileTransferResponse { raw_response: json })
     }
 
     /// Put credentials into a CloudShell environment (console session tokens only)
-    pub async fn put_credentials(
-        &self,
-        environment_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn put_credentials(&self, environment_id: &str) -> CloudResult<()> {
         let body = serde_json::json!({ "EnvironmentId": environment_id });
-        self.call_api("putCredentials", body.to_string().as_bytes())
-            .await?;
+        self.call_api("putCredentials", &body).await?;
         Ok(())
     }
 
-    /// Call a CloudShell API operation
-    async fn call_api(
+    async fn call_api_json(
         &self,
         operation: &str,
-        body: &[u8],
-    ) -> Result<String, Box<dyn std::error::Error>> {
+        body: &serde_json::Value,
+    ) -> CloudResult<serde_json::Value> {
+        let response = self.call_api(operation, body).await?;
+        Ok(serde_json::from_str(&response)?)
+    }
+
+    /// Call a CloudShell API operation
+    async fn call_api(&self, operation: &str, body: &serde_json::Value) -> CloudResult<String> {
         let service = "cloudshell";
         let host = format!("{}.{}.amazonaws.com", service, self.region);
         let url = format!("https://{}/{}", host, operation);
@@ -273,12 +312,15 @@ impl CloudShellClient {
             ("host", host.as_str()),
         ];
 
+        let body_bytes = serde_json::to_vec(body)?;
+
         let signable_request = SignableRequest::new(
             "POST",
             &url,
             headers_for_signing.iter().copied(),
-            SignableBody::Bytes(body),
-        )?;
+            SignableBody::Bytes(&body_bytes),
+        )
+        .map_err(|err| CloudShellError::Request(err.to_string()))?;
 
         // Convert credentials to Identity for signing
         let identity = self.credentials.clone().into();
@@ -291,9 +333,11 @@ impl CloudShellClient {
                 .name(service)
                 .time(SystemTime::now())
                 .settings(SigningSettings::default())
-                .build()?,
+                .build()
+                .map_err(|err| CloudShellError::Request(err.to_string()))?,
         );
-        let signing_result = sign(signable_request, &signing_params)?;
+        let signing_result = sign(signable_request, &signing_params)
+            .map_err(|err| CloudShellError::Request(err.to_string()))?;
         let signing_instructions = signing_result.output();
 
         // Build final request with all headers
@@ -301,37 +345,95 @@ impl CloudShellClient {
 
         // Add Content-Type header
         final_headers.insert(
-            "Content-Type".parse::<reqwest::header::HeaderName>()?,
-            "application/x-amz-json-1.1".parse::<reqwest::header::HeaderValue>()?,
+            "Content-Type"
+                .parse::<reqwest::header::HeaderName>()
+                .map_err(|err| CloudShellError::Request(err.to_string()))?,
+            "application/x-amz-json-1.1"
+                .parse::<reqwest::header::HeaderValue>()
+                .map_err(|err| CloudShellError::Request(err.to_string()))?,
         );
 
         // Add SigV4 signed headers
         for (name, value) in signing_instructions.headers() {
             final_headers.insert(
-                name.parse::<reqwest::header::HeaderName>()?,
-                value.parse::<reqwest::header::HeaderValue>()?,
+                name.parse::<reqwest::header::HeaderName>()
+                    .map_err(|err| CloudShellError::Request(err.to_string()))?,
+                value
+                    .parse::<reqwest::header::HeaderValue>()
+                    .map_err(|err| CloudShellError::Request(err.to_string()))?,
             );
         }
 
         // Make HTTP POST request
-        let client = reqwest::Client::new();
-        let response = client
-            .post(&url)
-            .headers(final_headers)
-            .body(body.to_vec())
-            .send()
-            .await?;
+        let retryable_operation = is_retryable_operation(operation);
+        let mut attempt = 0;
 
-        // Handle response
-        let status = response.status();
-        let response_body = response.text().await?;
+        loop {
+            attempt += 1;
+            let response = match self
+                .http_client
+                .post(&url)
+                .headers(final_headers.clone())
+                .body(body_bytes.clone())
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err)
+                    if retryable_operation
+                        && attempt < 3
+                        && (err.is_timeout() || err.is_connect()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+                Err(err) => return Err(CloudShellError::Network(err.to_string())),
+            };
 
-        if status.is_success() {
-            Ok(response_body)
-        } else {
-            Err(format!("CloudShell API error: {} - {}", status, response_body).into())
+            let status = response.status();
+            if retryable_operation && is_retryable_status(status) && attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                continue;
+            }
+
+            let response_body = match response.text().await {
+                Ok(body) => body,
+                Err(err)
+                    if retryable_operation
+                        && attempt < 3
+                        && (err.is_timeout() || err.is_connect()) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
+                Err(err) => return Err(CloudShellError::Network(err.to_string())),
+            };
+
+            return if status.is_success() {
+                Ok(response_body)
+            } else {
+                Err(CloudShellError::Aws {
+                    status: status.to_string(),
+                    message: response_body,
+                })
+            };
         }
     }
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_retryable_operation(operation: &str) -> bool {
+    matches!(operation, "describeEnvironments" | "getEnvironmentStatus")
 }
 
 /// VPC configuration for environments
@@ -354,9 +456,6 @@ impl VpcConfig {
     /// * `subnet_ids` - List of subnet IDs (at least 1 required)
     /// * `security_group_ids` - List of security group IDs (max 5)
     ///
-    /// # Panics
-    /// Panics if more than 5 security groups are provided
-    ///
     /// # Example
     /// ```
     /// use cloudshell_rs::VpcConfig;
@@ -367,12 +466,6 @@ impl VpcConfig {
     /// );
     /// ```
     pub fn new(vpc_id: String, subnet_ids: Vec<String>, security_group_ids: Vec<String>) -> Self {
-        if security_group_ids.len() > 5 {
-            panic!(
-                "Max 5 security groups allowed, got {}",
-                security_group_ids.len()
-            );
-        }
         VpcConfig {
             vpc_id,
             subnet_ids,
@@ -394,7 +487,10 @@ impl VpcConfig {
     /// };
     /// assert!(vpc.validate().is_err());
     /// ```
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.vpc_id.trim().is_empty() {
+            return Err("VPC ID cannot be empty".to_string());
+        }
         if self.security_group_ids.len() > 5 {
             return Err(format!(
                 "Max 5 security groups allowed, got {}",
@@ -404,7 +500,39 @@ impl VpcConfig {
         if self.subnet_ids.is_empty() {
             return Err("At least 1 subnet is required".to_string());
         }
+        if self.subnet_ids.iter().any(|id| id.trim().is_empty()) {
+            return Err("Subnet IDs cannot be empty".to_string());
+        }
+        if self
+            .security_group_ids
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err("Security group IDs cannot be empty".to_string());
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{is_retryable_operation, is_retryable_status};
+
+    #[test]
+    fn retries_only_read_only_operations() {
+        assert!(is_retryable_operation("describeEnvironments"));
+        assert!(is_retryable_operation("getEnvironmentStatus"));
+        assert!(!is_retryable_operation("createEnvironment"));
+        assert!(!is_retryable_operation("createSession"));
+    }
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
     }
 }
 
@@ -425,7 +553,7 @@ impl DescribeEnvironmentsResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
@@ -454,7 +582,7 @@ impl CreateEnvironmentResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
@@ -475,7 +603,7 @@ impl StopEnvironmentResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
@@ -512,7 +640,7 @@ impl EnvironmentStatusResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
@@ -549,7 +677,7 @@ impl CreateSessionResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
@@ -599,7 +727,7 @@ impl FileTransferResponse {
     }
 
     /// Pretty-print the response
-    pub fn pretty_print(&self) -> Result<String, serde_json::error::Error> {
+    pub fn pretty_print(&self) -> std::result::Result<String, serde_json::error::Error> {
         serde_json::to_string_pretty(&self.raw_response)
     }
 }
