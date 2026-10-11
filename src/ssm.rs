@@ -162,36 +162,60 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Relay the plugin's stdout to the local terminal and signal once the ready marker appears.
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Feed one chunk of plugin output into the setup filter.
+///
+/// While setup is running, output is discarded so the shell's echo of the credential lines is
+/// never shown. Returns `Some(visible)` once the ready marker is seen, where `visible` is the
+/// output that followed it. Returns `None` while output is still being discarded.
+fn filter_setup_output(pending: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<u8>> {
+    pending.extend_from_slice(chunk);
+    if let Some(pos) = find_subslice(pending, READY_MARKER.as_bytes()) {
+        let visible = pending[pos + READY_MARKER.len()..].to_vec();
+        pending.clear();
+        return Some(visible);
+    }
+    // Keep only a tail that could be the start of a marker split across reads
+    let keep = READY_MARKER.len() - 1;
+    if pending.len() > keep {
+        let drop_len = pending.len() - keep;
+        pending.drain(..drop_len);
+    }
+    None
+}
+
+/// Relay the plugin's stdout to the local terminal.
+///
+/// Output is hidden until the ready marker appears, so nothing from the credential setup is
+/// shown. After that, output is passed through unchanged. Signals `ready` once the marker is seen.
 fn spawn_output_relay(mut stdout: ChildStdout, ready: mpsc::Sender<()>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut out = std::io::stdout();
         let mut buf = [0u8; 1024];
-        let mut tail = String::new();
-        let mut signalled = false;
+        let mut pending = Vec::new();
+        let mut setup_done = false;
         loop {
             let n = match stdout.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let _ = out.write_all(&buf[..n]);
-            let _ = out.flush();
-            if !signalled {
-                tail.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if tail.contains(READY_MARKER) {
-                    signalled = true;
-                    let _ = ready.send(());
-                }
-                // Keep only the last 256 characters so the buffer stays small
-                if tail.len() > 4096 {
-                    let keep_from = tail
-                        .char_indices()
-                        .rev()
-                        .nth(255)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    tail.drain(..keep_from);
-                }
+            let chunk = &buf[..n];
+            if setup_done {
+                let _ = out.write_all(chunk);
+                let _ = out.flush();
+                continue;
+            }
+            if let Some(visible) = filter_setup_output(&mut pending, chunk) {
+                setup_done = true;
+                let _ = out.write_all(&visible);
+                let _ = out.flush();
+                let _ = ready.send(());
             }
         }
     })
@@ -262,12 +286,38 @@ async fn send_credentials_to_shell(
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::{filter_setup_output, shell_quote};
 
     #[test]
     fn shell_quote_neutralizes_metacharacters() {
         assert_eq!(shell_quote("abc"), "'abc'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+    }
+
+    #[test]
+    fn setup_output_containing_secrets_is_never_returned() {
+        let mut pending = Vec::new();
+        let echoed = b"export AWS_SECRET_ACCESS_KEY='s3cr3t'\n";
+        assert!(filter_setup_output(&mut pending, echoed).is_none());
+        let visible = filter_setup_output(&mut pending, b"__CS_READY__after\n").unwrap();
+        assert_eq!(visible, b"after\n");
+        assert!(!visible.windows(6).any(|w| w == b"s3cr3t"));
+    }
+
+    #[test]
+    fn marker_split_across_reads_is_detected() {
+        let mut pending = Vec::new();
+        assert!(filter_setup_output(&mut pending, b"echo secret __CS_RE").is_none());
+        let visible = filter_setup_output(&mut pending, b"ADY__tail").unwrap();
+        assert_eq!(visible, b"tail");
+    }
+
+    #[test]
+    fn pending_buffer_stays_bounded_without_marker() {
+        let mut pending = Vec::new();
+        let big = vec![b'x'; 10_000];
+        assert!(filter_setup_output(&mut pending, &big).is_none());
+        assert!(pending.len() < 12);
     }
 }
